@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${POSITIONAL[@]}" # restore positional parameters
 
-[ "$#" -ne 1 ] && echo "usage: netproxy <region>"$'\n'
+[ "$#" -ne 1 ] && echo "usage: doproxy <region>"$'\n'
 available_regions=$(doctl compute region list --no-header --format Slug,Name,Available | sort | grep 'true$' | cut -d" " -f1)
 droplet_region=$1
 if ! echo "$available_regions" | grep --silent --extended-regexp "^${droplet_region}$"; then
@@ -32,7 +32,7 @@ if ! echo "$available_regions" | grep --silent --extended-regexp "^${droplet_reg
     echo "$(echo "$available_regions" | sed -E 's/^(.*)/- \1/')"
 fi
 
-droplet_name='netproxy-'$(date +'%Y%m%d%H%M%S')
+droplet_name='doproxy-'$(date +'%Y%m%d%H%M%S')
 droplet_size='s-1vcpu-1gb'
 droplet_image='ubuntu-20-04-x64'
 droplet_temp_info=$(mktemp /tmp/temp-${droplet_name})
@@ -53,11 +53,14 @@ function create_droplet() {
         --image ${droplet_image} \
         --region ${droplet_region} \
         --ssh-keys ${ssh_key_id} \
+        --tag-name "doproxy" \
         >${droplet_temp_info}
-    echo -n "Droplet is being created..."
-
-    # this works first time most times, but sometimes need to to retry
     new_droplet_id=$(cat ${droplet_temp_info} | tail -1 | awk '{ print $1 }')
+}
+
+function get_droplet_ip() {
+    echo -n "Droplet is being created..."
+    # this works first time most times, but sometimes need to to retry
     while [ "$new_droplet_ip" = "" ]; do
         echo -n '.'
         sleep $UI_SLEEP_SECONDS
@@ -65,7 +68,6 @@ function create_droplet() {
     done
     echo " ${new_droplet_ip}"
 }
-create_droplet
 
 # wait for the droplet to become active, then scan for ssh keys
 function ssh_key_scan() {
@@ -84,18 +86,24 @@ function ssh_key_scan() {
     done
     echo " done"
 }
-ssh_key_scan
 
 function create_tunnel() {
     echo -n $'\n'"Creating tunnel on port 8080..."
     # create tunnel and keep it open for 4 hours
-    ssh -D 8080 root@${new_droplet_ip} "echo ' done'$'\n'; echo 'Netproxy tunnel running on port 8080.'; echo 'When you are finished, hit ctrl+c to close the tunnel and tear-down the resources'; sleep 14400"
+    ssh -C -D 8080 root@${new_droplet_ip} "echo ' done'$'\n'; echo 'doproxy tunnel running on port 8080.'; echo 'When you are finished, hit ctrl+c to close the tunnel and tear-down the resources'; sleep 14400"
 }
-create_tunnel
 
 function clean_up() {
-    echo "Deleting Droplet and temp files.."
+    echo $'\n'"Deleting Droplet and temp files.."
     doctl compute droplet delete -f ${new_droplet_id}
     rm ${droplet_temp_info}
 }
-clean_up
+
+create_droplet
+
+# from here onwards, make sure cleanup always occurs on exit/interrupt
+trap clean_up EXIT
+
+get_droplet_ip
+ssh_key_scan
+create_tunnel
