@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+
+UI_SLEEP_SECONDS=2
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+    -k | --ssh-key-id)
+        KEY_ID="$2"
+        shift # past argument
+        shift # past value
+        ;;
+    --*)
+        echo unrecognised option $key
+        exit 1
+        ;;
+    *)                     # unknown option
+        POSITIONAL+=("$1") # save it in an array for later
+        shift              # past argument
+        ;;
+    esac
+done
+set -- "${POSITIONAL[@]}" # restore positional parameters
+
+[ "$#" -ne 1 ] && echo "usage: netproxy <region>"$'\n'
+available_regions=$(doctl compute region list --no-header --format Slug,Name,Available | sort | grep 'true$' | cut -d" " -f1)
+droplet_region=$1
+if ! echo "$available_regions" | grep --silent --extended-regexp "^${droplet_region}$"; then
+    [ ! -z "$droplet_region" ] && echo "'$droplet_region' is not a valid region."
+    echo "Valid regions are:"
+    echo "$(echo "$available_regions" | sed -E 's/^(.*)/- \1/')"
+fi
+
+droplet_name='netproxy-'$(date +'%Y%m%d%H%M%S')
+droplet_size='s-1vcpu-1gb'
+droplet_image='ubuntu-20-04-x64'
+droplet_temp_info=$(mktemp /tmp/temp-${droplet_name})
+
+# use first ssh key returned by doctl key list if a key id is not provided as an argument
+[ -z "$ssh_key_id" ] && ssh_key_id=$(doctl compute k list --no-header --format ID | head -1)
+
+function create_droplet() {
+    echo "Creating Droplet with the following details:"
+    echo "Name:   ${droplet_name}"
+    echo "Size:   ${droplet_size}"
+    echo "Image:  ${droplet_image}"
+    echo "Region: ${droplet_region}"
+    echo ""
+
+    doctl compute droplet create ${droplet_name} \
+        --size ${droplet_size} \
+        --image ${droplet_image} \
+        --region ${droplet_region} \
+        --ssh-keys ${ssh_key_id} \
+        >${droplet_temp_info}
+    echo -n "Droplet is being created..."
+
+    # this works first time most times, but sometimes need to to retry
+    new_droplet_id=$(cat ${droplet_temp_info} | tail -1 | awk '{ print $1 }')
+    while [ "$new_droplet_ip" = "" ]; do
+        echo -n '.'
+        sleep $UI_SLEEP_SECONDS
+        new_droplet_ip=$(doctl compute droplet get ${new_droplet_id} --template "{{ .PublicIPv4}}")
+    done
+    echo " ${new_droplet_ip}"
+}
+create_droplet
+
+# wait for the droplet to become active, then scan for ssh keys
+function ssh_key_scan() {
+    echo -n "Waiting for Droplet to become active..."
+    while [ "$status" != "active" ]; do
+        echo -n '.'
+        sleep $UI_SLEEP_SECONDS
+        status=$(doctl compute droplet get ${new_droplet_id} --template "{{ .Status}}")
+    done
+    echo " ${status}"
+
+    echo -n "Waiting for Droplet to boot..."
+    until ssh-keyscan ${new_droplet_ip} 2>/dev/null >>~/.ssh/known_hosts; do
+        echo -n '.'
+        sleep $UI_SLEEP_SECONDS
+    done
+    echo " done"
+}
+ssh_key_scan
+
+function create_tunnel() {
+    echo -n $'\n'"Creating tunnel on port 8080..."
+    # create tunnel and keep it open for 4 hours
+    ssh -D 8080 root@${new_droplet_ip} "echo ' done'$'\n'; echo 'Netproxy tunnel running on port 8080.'; echo 'When you are finished, hit ctrl+c to close the tunnel and tear-down the resources'; sleep 14400"
+}
+create_tunnel
+
+function clean_up() {
+    echo "Deleting Droplet and temp files.."
+    doctl compute droplet delete -f ${new_droplet_id}
+    rm ${droplet_temp_info}
+}
+clean_up
